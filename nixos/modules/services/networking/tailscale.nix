@@ -55,7 +55,7 @@ in
     openFirewall = mkOption {
       default = false;
       type = types.bool;
-      description = "Whether to open the firewall for the specified port.";
+      description = "Whether to open the firewall for the Tailscale port and, if set, the peer relay port.";
     };
 
     useRoutingFeatures = mkOption {
@@ -137,6 +137,50 @@ in
       type = types.listOf types.str;
       default = [ ];
       example = [ "--no-logs-no-support" ];
+    };
+
+    relayServerPort = mkOption {
+      type = types.nullOr (types.either types.port (types.enum [ "" ]));
+      default = null;
+      description = ''
+        The port to use for Tailscale peer relay.
+
+        Set to a port number to enable (`0` selects a random unused port), `""` to explicitly disable,
+        or `null` (default) to leave the setting unmanaged.
+
+        Note: Tailscale settings are persistent. If you previously set a port and now want to disable it, set this to `""`,
+        or run {command}`tailscale set --relay-server-port=""` manually.
+        Setting it back to `null` will leave the last configured port active in Tailscale's state.
+
+        When {option}`openFirewall` is enabled, a concrete port is required; the firewall cannot be opened
+        automatically for a random port (`0`).
+
+        See <https://tailscale.com/docs/features/peer-relay>
+      '';
+    };
+
+    relayServerStaticEndpoints = mkOption {
+      type = types.nullOr (
+        types.listOf (
+          types.strMatching "^([0-9]{1,3}(\\.[0-9]{1,3}){3}|[[]([0-9a-fA-F:.]+)[]]):[0-9]{1,5}$"
+        )
+      );
+      default = null;
+      example = [
+        "192.0.2.2:40000"
+        "[2001:db8::1]:40000"
+      ];
+      description = ''
+        Additional static `ip:port` endpoints to advertise to other Tailscale devices as candidates for peer relay connections.
+
+        This is useful when the relay is reachable through port forwarding or a load balancer and cannot discover all
+        endpoints automatically. Only relevant when {option}`relayServerPort` is set, or when the relay server port
+        is configured outside of NixOS.
+
+        Set to `[ ]` to explicitly advertise no static endpoints, or `null` (default) to leave the setting unmanaged.
+
+        See <https://tailscale.com/docs/features/peer-relay#static-endpoints>
+      '';
     };
   };
 
@@ -234,27 +278,42 @@ in
         '';
     };
 
-    systemd.services.tailscaled-set = mkIf (cfg.extraSetFlags != [ ]) {
-      after = [
-        "tailscaled.service"
-        "tailscaled-autoconnect.service"
-      ];
-      wants = [ "tailscaled.service" ];
-      wantedBy = [ "tailscaled.service" ];
-      serviceConfig = {
-        Type = "oneshot";
+    systemd.services.tailscaled-set =
+      let
+        setFlags =
+          cfg.extraSetFlags
+          ++ lib.cli.toCommandLineGNU { } {
+            relay-server-port = cfg.relayServerPort;
+            relay-server-static-endpoints =
+              if cfg.relayServerStaticEndpoints == null then
+                null
+              else
+                lib.concatStringsSep "," cfg.relayServerStaticEndpoints;
+          };
+      in
+      mkIf (setFlags != [ ]) {
+        after = [
+          "tailscaled.service"
+          "tailscaled-autoconnect.service"
+        ];
+        wants = [ "tailscaled.service" ];
+        wantedBy = [ "tailscaled.service" ];
+        serviceConfig = {
+          Type = "oneshot";
+        };
+        script = ''
+          ${lib.getExe cfg.package} set ${escapeShellArgs setFlags}
+        '';
       };
-      script = ''
-        ${lib.getExe cfg.package} set ${escapeShellArgs cfg.extraSetFlags}
-      '';
-    };
 
     boot.kernel.sysctl = mkIf (cfg.useRoutingFeatures == "server" || cfg.useRoutingFeatures == "both") {
       "net.ipv4.conf.all.forwarding" = mkOverride 97 true;
       "net.ipv6.conf.all.forwarding" = mkOverride 97 true;
     };
 
-    networking.firewall.allowedUDPPorts = mkIf cfg.openFirewall [ cfg.port ];
+    networking.firewall.allowedUDPPorts = mkIf cfg.openFirewall (
+      [ cfg.port ] ++ lib.optional (builtins.isInt cfg.relayServerPort) cfg.relayServerPort
+    );
 
     networking.firewall.checkReversePath = mkIf (
       cfg.useRoutingFeatures == "client" || cfg.useRoutingFeatures == "both"
